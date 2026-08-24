@@ -206,7 +206,7 @@ Load the magnitude and phase, then convert the data to double precision and rota
 mag_nii = load_untouch_nii('Magnitude.nii');
 ph_nii = load_untouch_nii('Phase.nii');
 mag = rot90(double(mag_nii.img));
-raw_phase = double(phs_nii.img);
+raw_phase = double(ph_nii.img);
 ```
 Before start running Processing steps, determine whether the phase is already stored in radians.
 ```matlab
@@ -216,7 +216,7 @@ max(raw_phase(:))
 If the original phase NIfTI is already stored in radians, **do not perform the min/max scaling**.
 Instead use:
 ```matlab
-phase = rot90(double(phs_nii.img));
+phase = rot90(double(ph_nii.img));
 ```
 Then check dimension, magnitude and phase should return with same dimension:
 ```matlab
