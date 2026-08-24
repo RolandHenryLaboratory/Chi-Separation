@@ -68,14 +68,14 @@ Convert2mat(input_nii, outputpath, image_type)
   ```MATLAB
   addpath(genpath('/data/henry17/jiuyi_datasets/Chisep_Toolbox_v1.2.1'));
   ```
-- **For Windows:** After downloading MATLAB and the χ-separation toolbox to your computer, open MATLAB and add the toolbox and all its subfolders to the MATLAB path:
+- **For Windows:** After downloading MATLAB and the chi-separation toolbox to your computer, open MATLAB and add the toolbox and all its subfolders to the MATLAB path:
 
   ```matlab
   addpath(genpath('C:\path\to\Chisep_Toolbox_v1.2.1'));
   ```
-### Running the χ-Separation Toolbox
+### Running the chi-Separation Toolbox
 
-1. After adding the toolbox to the MATLAB path, launch the χ-separation interface from the MATLAB Command Window:
+1. After adding the toolbox to the MATLAB path, launch the chi-separation interface from the MATLAB Command Window:
 
    ```matlab
    Chisep
@@ -166,5 +166,492 @@ Inputs:
 - `TE`: Echo time used for the acquisition.
 - `output_path`: Directory where the processing outputs will be saved.
 
+## MEGET2 Star Sequence Susceptibility Source Separation Processing
 
+Wrapped phase images should not be directly upsampled using standard linear interpolation because phase values are circular and contain discontinuities at the −π and +π boundaries. Therefore, in this pipeline, all intermediate images are processed based on the original phase, and resampling is performed only on the R star, tissue phase, QSM, and mask images.
 
+### Current processing workflow: 
+```
+Multi-echo magnitude + wrapped phase → Phase scaling to radians → Tukey windowing → Brain mask generation → ROMEO phase unwrapping → Weighted echo averaging → V-SHARP background removal → Local field map → iLSQR dipole inversion → QSM → Resample magnitude / local field / QSM to the same target space → Input to chi-separation
+```
+Input Data: 4D multi-echo GRE magnitude and phase NIfTI images with fourth dimension corresponds to the different GRE echoes.
+Recommended directory structure:
+```
+subject/
+│
+├── Magnitude.nii
+├── Phase.nii
+├── Json
+│
+└── QSM_processing/
+```
+
+### 1. Input pre-processing and Processing Path Setup:
+Move MATLAB into the subject directory:
+```matlab
+cd('/path/to/subject')
+```
+Create a processing directory:
+
+```matlab
+output_root = fullfile(pwd,'QSM_processing');
+
+if ~exist(output_root,'dir')
+    mkdir(output_root);
+end
+```
+Load the magnitude and phase, then convert the data to double precision and rotate it following the chi-separation loading convention:
+
+```matlab
+mag_nii = load_untouch_nii('Magnitude.nii');
+ph_nii = load_untouch_nii('Phase.nii');
+mag = rot90(double(mag_nii.img));
+raw_phase = double(phs_nii.img);
+```
+Before start running Processing steps, determine whether the phase is already stored in radians.
+```matlab
+min(raw_phase(:))
+max(raw_phase(:))
+```
+If the original phase NIfTI is already stored in radians, **do not perform the min/max scaling**.
+Instead use:
+```matlab
+phase = rot90(double(phs_nii.img));
+```
+Then check dimension, magnitude and phase should return with same dimension:
+```matlab
+size(mag)
+size(phase)
+```
+### (Option Step) Convert Phase to Radians
+To scale the phase approximately into [-π, π]. 
+```matlab
+maxval = max(raw_phase(:));
+minval = min(raw_phase(:));
+phase = (rot90(raw_phase) - (minval + maxval)/2) / (maxval - minval) * 2*pi;
+```
+Check the result:
+```matlab
+min(phase(:))
+max(phase(:))
+```
+The values should now be approximately in range [-3.1416, 3.1416].
+Confirm that magnitude and phase have identical dimensions:
+```matlab
+size(phase)
+size(mag)
+```
+### 2. Read the Native Voxel Size
+Read the original voxel dimensions:
+```matlab
+VoxelSize_org = double(mag_nii.hdr.dime.pixdim(2:4));
+```
+Because the first two image dimensions were rotated during loading, swap the first two voxel dimensions:
+```matlab
+VoxelSize = VoxelSize_org([2 1 3]);
+```
+Check:
+```matlab
+VoxelSize
+```
+### 3.Parameters Setup
+**For Echo Time:** <br>
+The chi-separation workflow expects echo times in **milliseconds**.
+Create a column vector containing the actual echo times:
+```matlab
+TE = [
+    TE1
+    TE2
+    TE3
+    .
+    .
+    .
+    TEn
+];
+```
+Confirm that the number of echo times matches the number of echoes:
+```matlab
+length(TE)
+size(mag,4)
+```
+**For Magnitude Strength and B0 Direction** <br>
+For a 3 T acquisition:
+```matlab
+B0_strength = 3;
+```
+For a 7 T acquisition:
+```matlab
+B0_strength = 7;
+```
+**Force Even Spatial Dimensions** <br>
+The chi-separation processing workflow forces the first three image dimensions to be even.
+Apply even padding to magnitude:
+```matlab
+[mag,x_odd,y_odd,z_odd] = even_pad(mag);
+```
+Apply the same operation to phase:
+```matlab
+[phase,~,~,~] = even_pad(phase);
+```
+Save the padding information:
+```matlab
+EvenSizePadding = [x_odd y_odd z_odd];
+```
+Check:
+```matlab
+size(mag)
+size(phase)
+```
+The first three dimensions should now all be even.
+
+**Tukey Windowing** <br>
+Define the Tukey window:
+```matlab
+Tukey = 0.4;
+PhaseInverse = 0;
+```
+Generate the complex GRE image:
+```matlab
+imgc = mag .* exp(1i * phase * (-1)^PhaseInverse);
+```
+Apply Tukey windowing:
+```matlab
+imgc = tukey_windowing(imgc,Tukey);
+```
+Recover magnitude and wrapped phase:
+```matlab
+mag_tukey = abs(imgc);
+phase_tukey = angle(imgc);
+```
+Remove the temporary complex array:
+```matlab
+clear imgc
+```
+Check:
+```matlab
+size(mag_tukey)
+size(phase_tukey)
+```
+Both should remain:
+```text
+X × Y × Z × Necho
+```
+### 4. Brain Mask Generation
+Get the matrix size:
+```matlab
+MatrixSize = size(mag_tukey);
+```
+Generate the mask:
+```matlab
+Mask = BET(mag_tukey(:,:,:,1), MatrixSize(1:3), VoxelSize);
+```
+Convert to double:
+```matlab
+Mask = double(Mask);
+```
+### 5. ROMEO Phase Unwrapping + Total Field Map
+ROMEO creates temporary NIfTI files internally.
+Create a dedicated directory:
+```matlab
+romeo_dir = fullfile(output_root,'romeo_tmp');
+if ~exist(romeo_dir,'dir')
+    mkdir(romeo_dir);
+end
+```
+Check:
+```matlab
+exist(romeo_dir,'dir')
+```
+The result should be:
+```text
+7
+```
+Create the ROMEO parameter structure:
+```matlab
+parameters = struct();
+parameters.TE = TE;
+parameters.mag = mag_tukey;
+parameters.mask = double(Mask);
+parameters.calculate_B0 = false;
+parameters.phase_offset_correction = 'on';
+parameters.voxel_size = VoxelSize;
+parameters.additional_flags = '-q';
+parameters.output_dir = romeo_dir;
+```
+Inspect the configuration if needed:
+```matlab
+parameters
+```
+Run ROMEO:
+```matlab
+[unwrapped_phase,B0_romeo] = ...
+    ROMEO(double(phase_tukey),parameters);
+```
+ROMEO internally generates temporary files such as:
+```text
+QSM_processing/
+└── romeo_tmp/
+    └── Phase.nii
+```
+`Phase.nii` does **not** need to be manually created before running ROMEO.
+Remove possible NaN values:
+```matlab
+unwrapped_phase(isnan(unwrapped_phase)) = 0;
+```
+Check:
+```matlab
+size(unwrapped_phase)
+```
+The result should remain 4D:
+```text
+X × Y × Z × Necho
+```
+**Weighted Echo Averaging** <br>
+The multi echo unwrapped echoes are combined before V-SHARP.
+Convert TE from milliseconds to seconds:
+```matlab
+TE_s = TE/1000;
+```
+Set:
+```matlab
+t2s_roi = 0.04;
+```
+Calculate the weights:
+```matlab
+W = TE_s .* exp(-TE_s/t2s_roi);
+```
+Initialize the weighted phase:
+```matlab
+weightedSum = 0;
+TE_eff = 0;
+```
+Combine all echoes:
+```matlab
+for echo = 1:size(unwrapped_phase,4)
+    weightedSum = weightedSum + ...
+        W(echo)*unwrapped_phase(:,:,:,echo)./sum(W);
+    TE_eff = TE_eff + ...
+        W(echo)*TE_s(echo)./sum(W);
+end
+```
+Calculate the echo spacing:
+```matlab
+delta_TE = TE_s(2)-TE_s(1);
+```
+Generate the final 3D phase:
+```matlab
+UnwrappedPhase = ...
+    weightedSum / TE_eff * delta_TE .* Mask;
+```
+Check:
+```matlab
+size(UnwrappedPhase)
+```
+### 6.V-SHARP Background Field Removal
+Run V-SHARP:
+```matlab
+[local_field,mask_brain_new] = V_SHARP(UnwrappedPhase, Mask, 'voxelsize',VoxelSize, 'smvsize',12);
+```
+The chi-separation workflow uses:
+```text
+SMV size = 12
+```
+Check:
+```matlab
+size(local_field)
+size(mask_brain_new)
+```
+**Convert Tissue Phase to Hz** <br>
+Convert the local field:
+```matlab
+local_field_hz = ...
+    double(local_field) / (2*pi*delta_TE);
+```
+The major variables are now:
+```text
+local_field
+local_field_hz
+mask_brain_new
+```
+**Important:**
+`local_field` is used for iLSQR.
+`local_field_hz` is the corresponding local field expressed in Hz and can be used by later chi-separation processing.
+
+### 7.iLSQR Dipole Inversion
+Define the padding size:
+```matlab
+pad_size = [12 12 12];
+```
+Run iLSQR:
+```matlab
+QSM = QSM_iLSQR( ...
+    local_field, ...
+    mask_brain_new, ...
+    'TE',delta_TE*1000, ...
+    'B0',B0_strength, ...
+    'H',B0dir, ...
+    'padsize',pad_size, ...
+    'voxelsize',VoxelSize');
+```
+**Important:** <br>
+Use '`local_field` as the iLSQR input, not `local_field_hz`
+The TE supplied to iLSQR is:
+```matlab
+delta_TE*1000
+```
+because `delta_TE` was calculated in seconds while the iLSQR call uses milliseconds.
+
+### 8.Save a MATLAB Checkpoint
+Save all important intermediate results:
+```matlab
+save(fullfile(output_root,'QSM_processing_results.mat'), 'unwrapped_phase', 'UnwrappedPhase', 'local_field', 'local_field_hz', 'Mask', 'mask_brain_new', 'QSM', 'TE', 'delta_TE', 'VoxelSize', 'B0_strength', 'B0dir', 'EvenSizePadding', '-v7.3');
+```
+This allows processing to resume without repeating ROMEO.
+**Remove Even Padding Before Export** <br>
+Remove the padding introduced earlier:
+```matlab
+UnwrappedPhase_export = even_unpad(UnwrappedPhase,EvenSizePadding);
+local_field_export = even_unpad(local_field,EvenSizePadding);
+local_field_hz_export = even_unpad(local_field_hz,EvenSizePadding);
+QSM_export = even_unpad(QSM,EvenSizePadding);
+mask_brain_new_export = even_unpad(mask_brain_new,EvenSizePadding);
+```
+If:
+```matlab
+sum(EvenSizePadding) == 0
+```
+then no spatial padding was added.
+
+### 9.Export results and store to Mat file
+Use the original magnitude NIfTI as the spatial template:
+```matlab
+nii_out = mag_nii;
+nii_out.img = single(rot90(UnwrappedPhase_export,-1));
+nii_out.hdr.dime.datatype = 16;
+nii_out.hdr.dime.bitpix = 32;
+nii_out.hdr.dime.dim(1) = 3;
+nii_out.hdr.dime.dim(5) = 1;
+nii_out.hdr.dime.scl_inter = 0;
+nii_out.hdr.dime.scl_slope = 1;
+save_untouch_nii(nii_out, fullfile(output_root,'weighted_unwrapped_phase.nii'));
+nii_out.img = single(rot90(local_field_export,-1));
+save_untouch_nii(nii_out, fullfile(output_root,'VSHARP_local_field.nii'));
+nii_out.img = single(rot90(local_field_hz_export,-1));
+save_untouch_nii(nii_out, fullfile(output_root,'VSHARP_local_field_Hz.nii'));
+nii_out.img = single(rot90(QSM_export,-1));
+save_untouch_nii(nii_out, fullfile(output_root,'iLSQR_QSM.nii'));
+nii_out.img = single(rot90(mask_brain_new_export,-1));
+save_untouch_nii(nii_out, fullfile(output_root,'mask.nii'));
+```
+### 10. R2 star calculation
+R2* is calculated from the multi-echo GRE magnitude images using the compiled C application, and input expect input to be nii format.
+The program requires:
+1. Echo times in milliseconds
+2. Individual magnitude echoes in NIfTI format
+3. An output prefix
+The general syntax is:
+```bash
+/Chisep_Toolbox_v1.2.1/functions/supportfunc/gsl_expFitting <TE1,TE2,...ms> <echo1.nii> <echo2.nii> ... <out_prefix>
+```
+the program generates:
+```text
+`*_R2star.nii` -> R2* map in s^-1
+`*_S0.nii` -> Estimated S0 map
+`*_R2star_err.nii` -> Standard error of the fitted R2* value
+`*_S0_err.nii` -> Standard error of the fitted S0 value
+`*_chi2dof.nii` -> χ²/dof goodness-of-fit map
+```
+The main image required for the chi-separation workflow is:
+```text
+*_R2star.nii
+```
+**skull strip Calculated R2 star before resampling:** <br>
+```bash
+fslmaths *_R2star.nii.gz -mas mask.nii r2satr_stripped.nii.gz
+```
+### 11. Resampling Before chi-Separation Using FSL FLIRT
+Resample the magnitude image first:
+```bash
+flirt \
+    -in Magnitude.nii.gz \
+    -ref Magnitude.nii.gz \
+    -out magnitude_1mm.nii.gz \
+    -applyisoxfm 1
+```
+The output will be use as the reference image for following resampling:
+
+**Resample the Local Field** <br>
+```bash
+flirt \
+    -in VSHARP_local_field_Hz.nii \
+    -ref magnitude_1mm.nii.gz \
+    -out local_field_1mm.nii.gz \
+    -applyxfm \
+    -usesqform \
+    -interp trilinear
+```
+**Resample QSM** <br>
+```bash
+flirt \
+    -in iLSQR_QSM.nii \
+    -ref magnitude_1mm.nii.gz \
+    -out QSM_1mm.nii.gz \
+    -applyxfm \
+    -usesqform \
+    -interp trilinear
+```
+**Resample R2 star** <br>
+```bash
+flirt \
+    -in r2satr_stripped.nii.gz \
+    -ref magnitude_1mm.nii.gz \
+    -out r2satr_stripped.nii.gz \
+    -applyxfm \
+    -usesqform \
+    -interp trilinear
+```
+**Resample the Brain Mask** <br>
+Because the brain mask is binary, use nearest-neighbor interpolation:
+```bash
+flirt \
+    -in VSHARP_mask.nii \
+    -ref magnitude_1mm.nii.gz \
+    -out mask_1mm.nii.gz \
+    -applyxfm \
+    -usesqform \
+    -interp nearestneighbour
+```
+**Resample rest of Magnitude and Phase Echo by Echo**
+Those Resampled Phase will not play any role in this workflow, it serves only as a placeholder to ensure that the toolbox runs properly. Since the toolbox need to use resampled magnitude for R2 map generation.
+**Magnitude:** <br>
+```bash
+flirt \
+    -in magnitude_echo_n.nii.gz \
+    -ref magnitude_echo_n.nii.gz \
+    -out magnitude_1mm.nii.gz \
+    -applyisoxfm 1
+```
+**Phase** <br>
+```bash
+flirt \
+    -in phase_echo_n.nii.gz \
+    -ref phase_echo_n.nii.gz \
+    -out phase_e_n_1mm.nii.gz \
+    -applyisoxfm 1
+```
+
+**Convert to mat format file**
+Those images will be required to be import to toolbox and serve as intermedia images
+```matlab
+Convert2mat('mask_1mm.nii.gz', 'Mask.mat', 'Brain_mask');
+Convert2mat('r2star_stripped.nii.gz', 'r2s.mat', 'R2_star');
+Convert2mat('QSM_1mm.nii.gz', 'QSM.mat', 'QSM');
+Convert2mat('local_field_1mm.nii.gz', 'LocalField.mat', 'Tissue_phase');
+```
+### 12. Chi-separation processing
+This step still mainly preform using their GUI
+```matlab
+Chisep
+```
+Load the resampled magnitude and phase according to the instructions shown in the section above. Even though we use the resampled phase as input, it serves only as a placeholder to ensure that the toolbox runs properly; the images themselves do not play any role in this workflow.
+After loading the magnitude and phase images, load all the .mat files we just processed into the intermediate images section.
