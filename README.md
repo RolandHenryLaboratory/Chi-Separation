@@ -35,7 +35,7 @@ gsl_imFitting <TE1,TE2,...ms> <mask.nii> <echo1_im.nii> <echo2_im.nii> ... <outp
 ```
 - Convert NIFTIs to MAT file <br>
 
-`Convert2mat` reads a NIfTI image, reorients it, and saves it as a `.mat` file using the variable name required by the χ-separation toolbox.
+`Convert2mat` reads a NIfTI image, reorients it, and saves it as a `.mat` file using the variable name required by the chi-separation toolbox.
 
 ```matlab
 Convert2mat(input_nii, outputpath, image_type)
@@ -559,7 +559,7 @@ the program generates:
 `*_S0.nii` -> Estimated S0 map
 `*_R2star_err.nii` -> Standard error of the fitted R2* value
 `*_S0_err.nii` -> Standard error of the fitted S0 value
-`*_chi2dof.nii` -> χ²/dof goodness-of-fit map
+`*_chi2dof.nii` -> dof goodness-of-fit map
 ```
 The main image required for the chi-separation workflow is:
 ```text
