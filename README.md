@@ -276,6 +276,9 @@ For a 7 T acquisition:
 B0_strength = 7;
 ```
 For the B0 direction, I am currently loading the original magnitude image into the toolbox. After the toolbox asks you to import the JSON file, check the B0 direction displayed in the Parameters section.
+```matlab
+b0dir = [];
+```
 
 **Force Even Spatial Dimensions** <br>
 The chi-separation processing workflow forces the first three image dimensions to be even.
