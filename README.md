@@ -259,15 +259,7 @@ VoxelSize
 The chi-separation workflow expects echo times in **milliseconds**.
 Create a column vector containing the actual echo times:
 ```matlab
-TE = [
-    TE1
-    TE2
-    TE3
-    .
-    .
-    .
-    TEn
-];
+TE = [TE1 TE2 TE3 ... TEn];
 ```
 Confirm that the number of echo times matches the number of echoes:
 ```matlab
